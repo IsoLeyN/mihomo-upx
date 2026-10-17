@@ -1,0 +1,117 @@
+name: Build mihomo (linux/arm64)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 1 * *'
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+      changed: ${{ steps.latest.outputs.changed }}
+    steps:
+      - name: Get latest upstream tag
+        id: latest
+        run: |
+          LATEST=$(git ls-remote --tags --refs \
+            https://github.com/MetaCubeX/mihomo.git \
+            | awk -F/ '{print $NF}' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n1)
+          echo "Upstream latest tag: $LATEST"
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+
+          # Проверяем, есть ли уже такой релиз у нас
+          if gh release view "$LATEST" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: check
+    # При ручном запуске собираем всегда, при schedule — только если тег новый
+    if: needs.check.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mihomo (Meta branch, нужный тег)
+        uses: actions/checkout@v4
+        with:
+          repository: MetaCubeX/mihomo
+          ref: ${{ needs.check.outputs.version }}
+          path: mihomo
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: mihomo/go.mod
+          cache-dependency-path: mihomo/go.sum
+
+      - name: Install UPX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl
+
+      - name: Build
+        working-directory: mihomo
+        run: |
+          go mod download
+
+          VERSION=$(git describe --tags 2>/dev/null || git rev-parse --short HEAD)
+          BUILDTIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+            -tags no_tailscale,no_zerotier,no_fake_tcp \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=$VERSION' \
+                      -X 'github.com/metacubex/mihomo/constant.BuildTime=$BUILDTIME' \
+                      -s -w -buildid=" \
+            -o bin/mihomo-linux-arm64 .
+
+          echo "Built: $(ls -lh bin/mihomo-linux-arm64)"
+
+      - name: Compress with UPX
+        working-directory: mihomo
+        run: |
+          upx --ultra-brute --lzma bin/mihomo-linux-arm64 -o bin/mihomo-linux-arm64.upx
+          mv bin/mihomo-linux-arm64.upx bin/mihomo-linux-arm64
+          echo "Compressed: $(ls -lh bin/mihomo-linux-arm64)"
+          file bin/mihomo-linux-arm64
+
+      - name: Create release (без артефактов)
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: mihomo
+        run: |
+          TAG="${{ needs.check.outputs.version }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "mihomo $TAG (linux/arm64)" \
+            --notes "Автосборка из MetaCubeX/mihomo @ \`$TAG\`" \
+            bin/mihomo-linux-arm64
+
+      - name: Upload release (ручной запуск)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: mihomo
+        run: |
+          TAG="${{ needs.check.outputs.version }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" bin/mihomo-linux-arm64 --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "mihomo $TAG (linux/arm64)" \
+              --notes "Ручная сборка из MetaCubeX/mihomo @ \`$TAG\`" \
+              bin/mihomo-linux-arm64
+          fi
